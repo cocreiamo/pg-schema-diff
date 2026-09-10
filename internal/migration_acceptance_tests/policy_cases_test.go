@@ -662,13 +662,13 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
 		name: "Create policy with role containing double quote",
 		roles: []string{
 			`"evil""role"`,
-        },
-        oldSchemaDDL: []string{
+		},
+		oldSchemaDDL: []string{
 			`
                 CREATE TABLE foobar();
 			`,
-        },
-        newSchemaDDL: []string{
+		},
+		newSchemaDDL: []string{
 			`
                 CREATE TABLE foobar();
                 CREATE POLICY foobar_policy ON foobar
@@ -678,14 +678,14 @@ var policyAcceptanceTestCases = []acceptanceTestCase{
                     USING (true)
                     WITH CHECK (true);
 			`,
-        },
-        expectedHazardTypes: []diff.MigrationHazardType{
-            diff.MigrationHazardTypeAuthzUpdate,
-        },
-    },
-    {
-        name: "Alter policy with role containing SQL injection payload",
-        roles: []string{
+		},
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+		},
+	},
+	{
+		name: "Alter policy with role containing SQL injection payload",
+		roles: []string{
 			`"x""; DROP TABLE foobar; --"`,
 		},
 		oldSchemaDDL: []string{
