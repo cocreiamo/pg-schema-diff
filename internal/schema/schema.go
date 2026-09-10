@@ -55,6 +55,7 @@ type Schema struct {
 	NamedSchemas          []NamedSchema
 	Extensions            []Extension
 	Enums                 []Enum
+	Domains               []Domain
 	Tables                []Table
 	Indexes               []Index
 	ForeignKeyConstraints []ForeignKeyConstraint
@@ -72,6 +73,15 @@ func (s Schema) Normalize() Schema {
 	s.NamedSchemas = sortSchemaObjectsByName(s.NamedSchemas)
 	s.Extensions = sortSchemaObjectsByName(s.Extensions)
 	s.Enums = sortSchemaObjectsByName(s.Enums)
+
+	var normDomains []Domain
+	for _, d := range sortSchemaObjectsByName(s.Domains) {
+		d.Constraints = sortByKey(d.Constraints, func(c DomainConstraint) string {
+			return c.EscapedName
+		})
+		normDomains = append(normDomains, d)
+	}
+	s.Domains = normDomains
 
 	var normTables []Table
 	for _, t := range sortSchemaObjectsByName(s.Tables) {
@@ -217,6 +227,22 @@ type Extension struct {
 type Enum struct {
 	SchemaQualifiedName
 	Labels []string
+}
+
+type DomainConstraint struct {
+	EscapedName string
+	// Expression is the output of pg_get_constraintdef, e.g., CHECK ((VALUE > 0))
+	Expression string
+}
+
+type Domain struct {
+	SchemaQualifiedName
+	// BaseType is the output of format_type on the underlying type, e.g., "numeric(14,2)"
+	BaseType string
+	// Default is the output of pg_get_expr on the default; empty if there is none
+	Default     string
+	NotNull     bool
+	Constraints []DomainConstraint
 }
 
 type Table struct {
@@ -724,6 +750,13 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("starting enums future: %w", err)
 	}
 
+	domainsFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Domain, error) {
+		return s.fetchDomains(ctx)
+	})
+	if err != nil {
+		return Schema{}, fmt.Errorf("starting domains future: %w", err)
+	}
+
 	tablesFuture, err := concurrent.SubmitFuture(ctx, goroutineRunner, func() ([]Table, error) {
 		return s.fetchTables(ctx)
 	})
@@ -802,6 +835,11 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		return Schema{}, fmt.Errorf("getting enums: %w", err)
 	}
 
+	domains, err := domainsFuture.Get(ctx)
+	if err != nil {
+		return Schema{}, fmt.Errorf("getting domains: %w", err)
+	}
+
 	tables, err := tablesFuture.Get(ctx)
 	if err != nil {
 		return Schema{}, fmt.Errorf("getting tables: %w", err)
@@ -851,6 +889,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context) (Schema, error) {
 		NamedSchemas:          schemas,
 		Extensions:            extensions,
 		Enums:                 enums,
+		Domains:               domains,
 		Tables:                tables,
 		Indexes:               indexes,
 		ForeignKeyConstraints: fkCons,
@@ -944,6 +983,47 @@ func (s *schemaFetcher) fetchEnums(ctx context.Context) ([]Enum, error) {
 	)
 
 	return enums, nil
+}
+
+func (s *schemaFetcher) fetchDomains(ctx context.Context) ([]Domain, error) {
+	rawDomains, err := s.q.GetDomains(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetDomains: %w", err)
+	}
+
+	var domains []Domain
+	for _, rawDomain := range rawDomains {
+		if len(rawDomain.ConstraintNames) != len(rawDomain.ConstraintDefs) {
+			return nil, fmt.Errorf("domain %s: %d constraint names but %d definitions", rawDomain.DomainName, len(rawDomain.ConstraintNames), len(rawDomain.ConstraintDefs))
+		}
+		var constraints []DomainConstraint
+		for i, name := range rawDomain.ConstraintNames {
+			constraints = append(constraints, DomainConstraint{
+				EscapedName: EscapeIdentifier(name),
+				Expression:  rawDomain.ConstraintDefs[i],
+			})
+		}
+		domains = append(domains, Domain{
+			SchemaQualifiedName: SchemaQualifiedName{
+				SchemaName:  rawDomain.DomainSchemaName,
+				EscapedName: EscapeIdentifier(rawDomain.DomainName),
+			},
+			BaseType:    rawDomain.BaseType,
+			Default:     rawDomain.DefaultExpression,
+			NotNull:     rawDomain.NotNull,
+			Constraints: constraints,
+		})
+	}
+
+	domains = filterSliceByName(
+		domains,
+		func(domain Domain) SchemaQualifiedName {
+			return domain.SchemaQualifiedName
+		},
+		s.nameFilter,
+	)
+
+	return domains, nil
 }
 
 func (s *schemaFetcher) fetchTables(ctx context.Context) ([]Table, error) {
