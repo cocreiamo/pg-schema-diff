@@ -1,0 +1,38 @@
+name: release
+# Stripe non pubblica binari: il fork li compila e li allega alla Release,
+# così mise li installa con `ubi:cocreiamo/pg-schema-diff` — cocreiamo-platform ADR 0008.
+on:
+  push:
+    tags:
+      - "v*-rogita.*"
+permissions:
+  contents: write
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            out="dist/pg-schema-diff_${version}_${os}_${arch}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=${version}" \
+              -o "${out}/pg-schema-diff" ./cmd/pg-schema-diff
+            tar -C "${out}" -czf "${out}.tar.gz" pg-schema-diff
+          done
+          (cd dist && sha256sum *.tar.gz > checksums.txt)
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true

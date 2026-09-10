@@ -1,0 +1,47 @@
+name: sync-upstream
+# `main` specchia stripe/pg-schema-diff; `rogita` cumula sopra `main` i fix che a
+# monte mancano ancora. Il rebase lascia cadere da solo ciò che a monte hanno
+# fuso; se va in conflitto, si apre una issue invece di pushare — ADR 0008.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: rogita
+      - name: Mirror main from upstream
+        run: |
+          set -euo pipefail
+          git config user.name "cocreiamo-sync[bot]"
+          git config user.email "sync@cocreiamo.com"
+          git remote add upstream https://github.com/stripe/pg-schema-diff.git
+          git fetch upstream main
+          git push origin upstream/main:main
+      - name: Rebase rogita onto main
+        id: rebase
+        run: |
+          set -euo pipefail
+          if git rebase upstream/main; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            git push --force-with-lease origin rogita
+          else
+            git rebase --abort
+            echo "clean=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open an issue on conflict
+        if: steps.rebase.outputs.clean == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Rebase di rogita su upstream/main in conflitto" \
+            --body "Il sync settimanale non ha potuto rebasare \`rogita\` su \`upstream/main\` ($(git rev-parse --short upstream/main)). Va risolto a mano: i fix in conflitto sono probabilmente stati fusi a monte in una forma diversa." \
+            --label sync
