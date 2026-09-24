@@ -50,6 +50,11 @@ var (
 		Type:    MigrationHazardTypeAcquiresShareLock,
 		Message: "Non-concurrent index creates will lock out writes to the table during the duration of the index build.",
 	}
+	migrationHazardConstraintIndexBuildAcquiresLock = MigrationHazard{
+		Type: MigrationHazardTypeAcquiresAccessExclusiveLock,
+		Message: "Exclusion and WITHOUT OVERLAPS constraints cannot be built concurrently: adding one builds its index " +
+			"while locking out all accesses to the table for the duration of the build.",
+	}
 	migrationHazardIndexDroppedAcquiresLock = MigrationHazard{
 		Type:    MigrationHazardTypeAcquiresAccessExclusiveLock,
 		Message: "Index drops will lock out all accesses to the table. They should be fast.",
@@ -541,9 +546,10 @@ func buildIndexDiff(deps indexDiffConfig, old, new schema.Index) (diff indexDiff
 	}
 
 	if !isOnPartitionedTable {
-		if old.Constraint == nil && new.Constraint != nil {
+		if old.Constraint == nil && new.Constraint != nil && new.Constraint.CanBeAttachedToIndex() {
 			// Attach the constraint using the existing index. This cannot be done if the index is on a partitioned table.
-			// In the case of an index being on a partitioned table, it must be re-created
+			// In the case of an index being on a partitioned table, it must be re-created. An exclusion or
+			// WITHOUT OVERLAPS constraint cannot be attached to an existing index either, so the index is re-created.
 			updatedOld.Constraint = new.Constraint
 		}
 		if old.Constraint != nil && new.Constraint != nil && old.Constraint.IsLocal && !new.Constraint.IsLocal {
@@ -1784,6 +1790,22 @@ func (isg *indexSQLVertexGenerator) addIdxStmtsWithHazards(index schema.Index) (
 			Timeout:     statementTimeoutDefault,
 			LockTimeout: lockTimeoutDefault,
 		}}, nil
+	}
+
+	if index.Constraint != nil && !index.Constraint.CanBeAttachedToIndex() {
+		// Exclusion constraints and WITHOUT OVERLAPS constraints are backed by a non-b-tree index, which cannot be
+		// built first and then attached with "USING INDEX". The constraint is added with its full definition, which
+		// builds the index while holding a lock on the table.
+		stmts = append(stmts, Statement{
+			DDL:         fmt.Sprintf("%s %s", addConstraintPrefix(index.OwningRelName, index.Constraint.EscapedConstraintName), index.Constraint.ConstraintDef),
+			Timeout:     statementTimeoutDefault,
+			LockTimeout: lockTimeoutDefault,
+			Hazards:     []MigrationHazard{migrationHazardConstraintIndexBuildAcquiresLock},
+		})
+		if index.ParentIdx != nil && isg.attachPartitionSQLVertexGenerator.isPartitionAlreadyAttachedBeforeIndexBuilds(index.OwningRelName) {
+			stmts = append(stmts, buildAttachIndex(index))
+		}
+		return stmts, nil
 	}
 
 	// Only indexes on non-partitioned tables can be created concurrently

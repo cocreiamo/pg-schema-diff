@@ -35,6 +35,10 @@ type (
 		// planOpts is a list of options that should be passed to the plan generator
 		planOpts []diff.PlanOpt
 
+		// minimumPostgresVersionNum skips the test case on servers older than this server_version_num (e.g., 180000 for
+		// syntax that only exists on Postgres 18+)
+		minimumPostgresVersionNum int
+
 		// roles is a list of roles that should be created before the DDL is applied
 		roles        []string
 		oldSchemaDDL []string
@@ -130,6 +134,13 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 	rootDb, err := sql.Open("pgx", engine.GetPostgresDatabaseDSN())
 	require.NoError(t, err)
 	defer rootDb.Close()
+	if tc.minimumPostgresVersionNum > 0 {
+		var serverVersionNum int
+		require.NoError(t, rootDb.QueryRow("SELECT current_setting('server_version_num')::INT").Scan(&serverVersionNum))
+		if serverVersionNum < tc.minimumPostgresVersionNum {
+			t.Skipf("requires server_version_num >= %d, got %d", tc.minimumPostgresVersionNum, serverVersionNum)
+		}
+	}
 	for _, r := range tc.roles {
 		_, err := rootDb.Exec(fmt.Sprintf("CREATE ROLE %s", r))
 		require.NoError(t, err)

@@ -373,8 +373,8 @@ type (
 	RelKind             string
 
 	// IndexConstraint informally represents a constraint that is always 1:1 with an index, i.e.,
-	// primary and unique constraints. It's easiest to just treat these like a property of the index rather than
-	// a separate entity
+	// primary, unique and exclusion constraints. It's easiest to just treat these like a property of the index rather
+	// than a separate entity
 	IndexConstraint struct {
 		Type                  IndexConstraintType
 		EscapedConstraintName string
@@ -382,6 +382,8 @@ type (
 		IsLocal               bool
 		IsDeferrable          bool
 		IsInitiallyDeferred   bool
+		// IsPeriod is true for a primary key or unique constraint declared WITHOUT OVERLAPS (Postgres 18+).
+		IsPeriod bool
 	}
 
 	Index struct {
@@ -406,7 +408,9 @@ type (
 )
 
 const (
-	PkIndexConstraintType IndexConstraintType = "p"
+	PkIndexConstraintType        IndexConstraintType = "p"
+	UniqueIndexConstraintType    IndexConstraintType = "u"
+	ExclusionIndexConstraintType IndexConstraintType = "x"
 
 	RelKindOrdinaryTable    RelKind = "r"
 	RelKindPartitionedTable RelKind = "p"
@@ -426,6 +430,14 @@ func (i Index) GetSchemaQualifiedName() SchemaQualifiedName {
 
 func (i Index) IsPk() bool {
 	return i.Constraint != nil && i.Constraint.Type == PkIndexConstraintType
+}
+
+// CanBeAttachedToIndex returns true if the constraint can be added to an already built index through
+// "ALTER TABLE ... ADD CONSTRAINT ... USING INDEX". Postgres only allows this for b-tree backed primary keys and
+// unique constraints: an exclusion constraint, or a primary key/unique constraint declared WITHOUT OVERLAPS, must
+// be added with its full definition, which builds its index.
+func (c IndexConstraint) CanBeAttachedToIndex() bool {
+	return c.Type != ExclusionIndexConstraintType && !c.IsPeriod
 }
 
 type CheckConstraint struct {
@@ -1269,6 +1281,7 @@ func (s *schemaFetcher) buildIndex(rawIndex queries.GetIndexesRow) Index {
 			IsLocal:               rawIndex.ConstraintIsLocal,
 			IsDeferrable:          rawIndex.ConstraintIsDeferrable,
 			IsInitiallyDeferred:   rawIndex.ConstraintIsInitiallyDeferred,
+			IsPeriod:              rawIndex.ConstraintIsPeriod,
 		}
 	}
 

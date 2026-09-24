@@ -166,7 +166,12 @@ SELECT
     )::TEXT [] AS column_names,
     COALESCE(con.conislocal, false) AS constraint_is_local,
     COALESCE(con.condeferrable, false) AS constraint_is_deferrable,
-    COALESCE(con.condeferred, false) AS constraint_is_initially_deferred
+    COALESCE(con.condeferred, false) AS constraint_is_initially_deferred,
+    -- pg_constraint.conperiod (WITHOUT OVERLAPS) only exists on Postgres 18+,
+    -- so it is read through the row's JSON form to keep the query version-agnostic.
+    COALESCE(
+        (TO_JSONB(con.*) ->> 'conperiod')::BOOLEAN, false
+    )::BOOLEAN AS constraint_is_period
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_index AS i ON (c.oid = i.indexrelid)
 INNER JOIN pg_catalog.pg_class AS table_c ON (i.indrelid = table_c.oid)
@@ -174,7 +179,7 @@ INNER JOIN pg_catalog.pg_namespace AS table_namespace
     ON table_c.relnamespace = table_namespace.oid
 LEFT JOIN
     pg_catalog.pg_constraint AS con
-    ON (c.oid = con.conindid AND con.contype IN ('p', 'u', null))
+    ON (c.oid = con.conindid AND con.contype IN ('p', 'u', 'x'))
 LEFT JOIN
     pg_catalog.pg_inherits AS idx_inherits
     ON (c.oid = idx_inherits.inhrelid)

@@ -592,7 +592,12 @@ SELECT
     )::TEXT [] AS column_names,
     COALESCE(con.conislocal, false) AS constraint_is_local,
     COALESCE(con.condeferrable, false) AS constraint_is_deferrable,
-    COALESCE(con.condeferred, false) AS constraint_is_initially_deferred
+    COALESCE(con.condeferred, false) AS constraint_is_initially_deferred,
+    -- pg_constraint.conperiod (WITHOUT OVERLAPS) only exists on Postgres 18+,
+    -- so it is read through the row's JSON form to keep the query version-agnostic.
+    COALESCE(
+        (TO_JSONB(con.*) ->> 'conperiod')::BOOLEAN, false
+    )::BOOLEAN AS constraint_is_period
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_index AS i ON (c.oid = i.indexrelid)
 INNER JOIN pg_catalog.pg_class AS table_c ON (i.indrelid = table_c.oid)
@@ -600,7 +605,7 @@ INNER JOIN pg_catalog.pg_namespace AS table_namespace
     ON table_c.relnamespace = table_namespace.oid
 LEFT JOIN
     pg_catalog.pg_constraint AS con
-    ON (c.oid = con.conindid AND con.contype IN ('p', 'u', null))
+    ON (c.oid = con.conindid AND con.contype IN ('p', 'u', 'x'))
 LEFT JOIN
     pg_catalog.pg_inherits AS idx_inherits
     ON (c.oid = idx_inherits.inhrelid)
@@ -627,24 +632,25 @@ WHERE
 `
 
 type GetIndexesRow struct {
-	Oid                   interface{}
-	IndexName             string
-	TableName             string
-	TableSchemaName       string
-	OwningTableRelkind    string
-	DefStmt               string
-	ConstraintName        string
-	ConstraintType        string
-	ConstraintDef         string
-	IndexIsValid          bool
-	IndexIsPk             bool
-	IndexIsUnique         bool
-	ParentIndexName       string
-	ParentIndexSchemaName string
-	ColumnNames           []string
-	ConstraintIsLocal              bool
-	ConstraintIsDeferrable         bool
-	ConstraintIsInitiallyDeferred  bool
+	Oid                           interface{}
+	IndexName                     string
+	TableName                     string
+	TableSchemaName               string
+	OwningTableRelkind            string
+	DefStmt                       string
+	ConstraintName                string
+	ConstraintType                string
+	ConstraintDef                 string
+	IndexIsValid                  bool
+	IndexIsPk                     bool
+	IndexIsUnique                 bool
+	ParentIndexName               string
+	ParentIndexSchemaName         string
+	ColumnNames                   []string
+	ConstraintIsLocal             bool
+	ConstraintIsDeferrable        bool
+	ConstraintIsInitiallyDeferred bool
+	ConstraintIsPeriod            bool
 }
 
 func (q *Queries) GetIndexes(ctx context.Context) ([]GetIndexesRow, error) {
@@ -675,6 +681,7 @@ func (q *Queries) GetIndexes(ctx context.Context) ([]GetIndexesRow, error) {
 			&i.ConstraintIsLocal,
 			&i.ConstraintIsDeferrable,
 			&i.ConstraintIsInitiallyDeferred,
+			&i.ConstraintIsPeriod,
 		); err != nil {
 			return nil, err
 		}
@@ -1526,13 +1533,16 @@ SELECT
     WHERE d.refobjid = c.oid)::TEXT [] AS table_dependencies,
     (SELECT ARRAY_AGG(DISTINCT
         proc_ns.nspname || '.' || pg_proc.proname || '(' ||
-        pg_catalog.pg_get_function_identity_arguments(pg_proc.oid) || ')')
+        pg_catalog.pg_get_function_identity_arguments(pg_proc.oid) || ')'
+    )
     FROM pg_catalog.pg_depend AS fd
     INNER JOIN pg_catalog.pg_rewrite AS fr ON fd.objid = fr.oid AND fr.ev_class = c.oid
     INNER JOIN pg_catalog.pg_depend AS fd2 ON fr.oid = fd2.objid
     INNER JOIN pg_catalog.pg_proc AS pg_proc ON fd2.refobjid = pg_proc.oid AND fd2.refclassid = 'pg_proc'::REGCLASS
     INNER JOIN pg_catalog.pg_namespace AS proc_ns ON pg_proc.pronamespace = proc_ns.oid
-    WHERE fd.refobjid = c.oid AND fd2.deptype = 'n' AND proc_ns.nspname NOT IN ('pg_catalog', 'information_schema')
+    WHERE fd.refobjid = c.oid
+      AND fd2.deptype = 'n'
+      AND proc_ns.nspname NOT IN ('pg_catalog', 'information_schema')
     )::TEXT [] AS function_dependencies,
     PG_GET_VIEWDEF(c.oid, true) AS view_definition
 FROM pg_catalog.pg_class AS c
@@ -1553,12 +1563,12 @@ WHERE
 `
 
 type GetViewsRow struct {
-	SchemaName        string
-	ViewName          string
-	RelOptions        []string
-	TableDependencies []string
+	SchemaName           string
+	ViewName             string
+	RelOptions           []string
+	TableDependencies    []string
 	FunctionDependencies []string
-	ViewDefinition    string
+	ViewDefinition       string
 }
 
 func (q *Queries) GetViews(ctx context.Context) ([]GetViewsRow, error) {
