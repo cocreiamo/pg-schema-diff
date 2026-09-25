@@ -6,6 +6,7 @@ import (
 	"fmt"
 	stdlog "log"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -71,17 +72,70 @@ type (
 
 var pgEngine *pgengine.Engine
 
+const (
+	// connectionsPerCase is how many connections one acceptance case holds at its peak: the
+	// template and temporary databases' pools of the plan generator, the pg_dump, the old and new
+	// schema readers. Measured on Postgres 18 with 100 max_connections: twelve cases in parallel
+	// exhausted it.
+	connectionsPerCase = 10
+	// reservedConnections are left to the superuser and to the harness itself.
+	reservedConnections = 10
+)
+
+// caseSlots bounds how many cases run at once, derived from the capacity of the server the harness
+// attaches to. Without it the concurrency was the number of cases, and a server with the default
+// 100 connections (PGSD_ENGINE_DSN) failed a case with "too many clients" depending on how many
+// cases existed — a red that said nothing about the change under test.
+var caseSlots chan struct{}
+
 func TestMain(m *testing.M) {
 	engine, err := pgengine.StartEngine()
 	if err != nil {
 		stdlog.Fatalf("Failed to start engine: %v", err)
 	}
 	pgEngine = engine
+	slots, err := slotsFor(engine)
+	if err != nil {
+		stdlog.Fatalf("Failed to size the case slots: %v", err)
+	}
+	caseSlots = make(chan struct{}, slots)
 	exitCode := m.Run()
 	if err := pgEngine.Close(); err != nil {
 		stdlog.Fatalf("Failed to close engine: %v", err)
 	}
 	os.Exit(exitCode)
+}
+
+// sharedServerRoles serializes the cases that create server-wide roles on a shared server.
+var sharedServerRoles sync.Mutex
+
+// dropRoles removes the roles a case created on a shared server, after its databases are gone.
+func dropRoles(t *testing.T, engine *pgengine.Engine, roles []string) {
+	db, err := sql.Open("pgx", engine.GetPostgresDatabaseDSN())
+	require.NoError(t, err)
+	defer db.Close()
+	for _, r := range roles {
+		_, err := db.Exec(fmt.Sprintf("DROP ROLE IF EXISTS %s", r))
+		require.NoError(t, err)
+	}
+}
+
+// slotsFor asks the server how many connections it allows and turns that into parallel cases.
+func slotsFor(engine *pgengine.Engine) (int, error) {
+	db, err := sql.Open("pgx", engine.GetPostgresDatabaseDSN())
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	var maxConnections int
+	if err := db.QueryRow("SELECT current_setting('max_connections')::int").Scan(&maxConnections); err != nil {
+		return 0, err
+	}
+	slots := (maxConnections - reservedConnections) / connectionsPerCase
+	if slots < 1 {
+		slots = 1
+	}
+	return slots, nil
 }
 
 // Simulates migrating a database and uses pgdump to compare the actual state to the expected state
@@ -92,6 +146,8 @@ func runTestCases(t *testing.T, acceptanceTestCases []acceptanceTestCase) {
 		tc := _tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
+			caseSlots <- struct{}{}
+			defer func() { <-caseSlots }()
 			runTest(t, tc)
 		})
 	}
@@ -123,11 +179,20 @@ func runTest(t *testing.T, tc acceptanceTestCase) {
 
 	engine := pgEngine
 	if len(tc.roles) > 0 {
-		// If the test needs roles (server-wide), provide isolation by spinning out a dedicated pgengine.
-		dedicatedEngine, err := pgengine.StartEngine()
-		require.NoError(t, err)
-		defer dedicatedEngine.Close()
-		engine = dedicatedEngine
+		if os.Getenv("PGSD_ENGINE_DSN") != "" {
+			// A shared server cannot be spun out: StartEngine attaches to the same instance, and roles
+			// are server-wide, so two cases creating "app_user" at once collided. On a shared server
+			// the cases that create roles run one at a time and drop what they created.
+			sharedServerRoles.Lock()
+			defer sharedServerRoles.Unlock()
+			defer dropRoles(t, engine, tc.roles)
+		} else {
+			// If the test needs roles (server-wide), provide isolation by spinning out a dedicated pgengine.
+			dedicatedEngine, err := pgengine.StartEngine()
+			require.NoError(t, err)
+			defer dedicatedEngine.Close()
+			engine = dedicatedEngine
+		}
 	}
 
 	// Create roles since they are global

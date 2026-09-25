@@ -105,12 +105,20 @@ func WithRootDatabase(db string) OnInstanceFactoryOpt {
 	}
 }
 
-// WithDropTimeout sets the timeout used when dropping database
+// WithDropTimeout sets the timeout used when dropping database. By default there is none: see
+// lifecycleStatementTimeout.
 func WithDropTimeout(d time.Duration) OnInstanceFactoryOpt {
 	return func(opts *onInstanceFactoryOptions) {
 		opts.dropTimeout = d
 	}
 }
+
+// lifecycleStatementTimeout is the statement_timeout of CREATE DATABASE and DROP DATABASE: none (0).
+// Both wait for a checkpoint, which under load takes seconds, and the 3-second default of the other
+// statements failed them — a temporary database created and never dropped, its connections and the
+// roles its case created left behind for the next case to collide with. They stay bounded by the
+// caller's context.
+const lifecycleStatementTimeout time.Duration = 0
 
 // WithRandReader seeds the random used to generate random SQL identifiers.
 func WithRandReader(randReader io.Reader) OnInstanceFactoryOpt {
@@ -146,7 +154,7 @@ func NewOnInstanceFactory(ctx context.Context, createConnPoolForDb CreateConnPoo
 		dbPrefix:       DefaultOnInstanceDbPrefix,
 		metadataSchema: DefaultOnInstanceMetadataSchema,
 		metadataTable:  DefaultOnInstanceMetadataTable,
-		dropTimeout:    DefaultStatementTimeout,
+		dropTimeout:    lifecycleStatementTimeout,
 		rootDatabase:   "postgres",
 		logger:         log.SimpleLogger(),
 		randReader:     rand.Reader,
@@ -194,6 +202,9 @@ func (o *onInstanceFactory) Create(ctx context.Context) (_ *Database, _retErr er
 	defer rootConn.Close()
 
 	tempDbName := o.options.dbPrefix + strings.ReplaceAll(dbUUID.String(), "-", "_")
+	if _, err := rootConn.ExecContext(ctx, fmt.Sprintf("SET SESSION statement_timeout = %d;", lifecycleStatementTimeout.Milliseconds())); err != nil {
+		return nil, fmt.Errorf("setting statement timeout: %w", err)
+	}
 	// Create the temporary database using template0, the default Postgres template with no user-defined objects.
 	if _, err = rootConn.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE %s TEMPLATE template0;", tempDbName)); err != nil {
 		return nil, fmt.Errorf("creating temporary database: %w", err)
@@ -282,7 +293,11 @@ func (o *onInstanceFactory) dropTempDatabase(ctx context.Context, dbName string)
 		return fmt.Errorf("setting statement timeout: %w", err)
 	}
 
-	_, err = rootConn.ExecContext(ctx, fmt.Sprintf("DROP DATABASE %s;", dbName))
+	// WITH (FORCE) (Postgres 13+) closes the sessions still attached to the temporary database
+	// instead of waiting for them: a plain DROP waits for every straggler, and under
+	// statement_timeout that wait failed the drop and left the database — and its
+	// connections — behind, which starved the next plans of connections.
+	_, err = rootConn.ExecContext(ctx, fmt.Sprintf("DROP DATABASE %s WITH (FORCE);", dbName))
 	if err != nil {
 		return fmt.Errorf("dropping temporary database: %w", err)
 	}
