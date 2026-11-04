@@ -1,7 +1,7 @@
 name: sync-upstream
-# `main` specchia stripe/pg-schema-diff; `rogita` cumula sopra `main` i fix che a
-# monte mancano ancora. Il rebase lascia cadere da solo ciò che a monte hanno
-# fuso; se va in conflitto, si apre una issue invece di pushare — ADR 0008.
+# Trunk-based fork: `main` carries our fixes on top of stripe/pg-schema-diff `main`,
+# which is mirrored to `upstream-main`. The weekly rebase drops by itself what upstream
+# has merged; on a conflict it opens an issue instead of pushing.
 on:
   schedule:
     - cron: "17 5 * * 1"
@@ -16,9 +16,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: rogita
+          ref: main
           persist-credentials: false
-      - name: Mirror main from upstream and rebase rogita
+      - name: Mirror upstream and rebase main
         id: sync
         env:
           GH_TOKEN: ${{ github.token }}
@@ -29,9 +29,9 @@ jobs:
           git config user.email "sync@cocreiamo.com"
           git remote add upstream https://github.com/stripe/pg-schema-diff.git
           git fetch upstream main
-          git push "$ORIGIN" upstream/main:main
+          git push "$ORIGIN" upstream/main:refs/heads/upstream-main
           if git rebase upstream/main; then
-            git push --force-with-lease "$ORIGIN" rogita
+            git push --force-with-lease "$ORIGIN" HEAD:main
             echo "clean=true" >> "$GITHUB_OUTPUT"
           else
             git rebase --abort
@@ -43,6 +43,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh issue create \
-            --title "Rebase di rogita su upstream/main in conflitto" \
-            --body "Il sync settimanale non ha potuto rebasare rogita su upstream/main. Va risolto a mano: i fix in conflitto sono probabilmente stati fusi a monte in una forma diversa." \
+            --title "Rebase of main on upstream/main has conflicts" \
+            --body "The weekly sync could not rebase main on upstream/main. Resolve it by hand: the conflicting fixes were probably merged upstream in a different form." \
             --label sync
